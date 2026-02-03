@@ -1,143 +1,216 @@
-from inspect import cleandoc
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import os
-import torch
-import sys
 import numpy as np
+import torch
 
-class ImageLoopbackCache:
+from comfy_api.latest import ComfyExtension, io, ui
+
+
+def _cache_dir(cache_path: str) -> str:
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(current_dir, cache_path)
+
+
+def _ensure_batch(image: torch.Tensor) -> torch.Tensor:
+    if image.dim() == 3:
+        return image.unsqueeze(0)
+    if image.dim() == 4:
+        return image
+    raise ValueError("Expected an IMAGE tensor with 3 or 4 dimensions.")
+
+
+def _tensor_to_pil(image: torch.Tensor) -> Image.Image:
+    image = _ensure_batch(image)[0].detach().cpu()
+    if image.dtype != torch.float32:
+        image = image.float()
+    image = (image * 255.0).clamp(0, 255).byte().numpy()
+    if image.ndim == 2:
+        image = np.repeat(image[:, :, None], 3, axis=2)
+    if image.shape[2] == 4:
+        return Image.fromarray(image, "RGBA")
+    return Image.fromarray(image, "RGB")
+
+
+def _pil_to_tensor(image: Image.Image) -> torch.Tensor:
+    if image.mode not in ("RGB", "RGBA"):
+        image = image.convert("RGB")
+    arr = np.array(image).astype(np.float32) / 255.0
+    if arr.ndim == 2:
+        arr = np.repeat(arr[:, :, None], 3, axis=2)
+    return torch.from_numpy(arr).unsqueeze(0)
+
+
+def _save_tensor_image(image: torch.Tensor, path: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    _tensor_to_pil(image).save(path)
+
+
+def _load_tensor_image(path: str) -> torch.Tensor:
+    with Image.open(path) as img:
+        return _pil_to_tensor(img)
+
+
+def _make_status_preview(image: torch.Tensor, status_lines: list[str]) -> torch.Tensor:
+    preview = _tensor_to_pil(image).convert("RGB")
+    draw = ImageDraw.Draw(preview)
+    font = ImageFont.load_default()
+    padding = 6
+    bbox = draw.textbbox((0, 0), "Ag", font=font)
+    line_height = bbox[3] - bbox[1]
+    rect_height = (line_height * len(status_lines)) + (padding * 2)
+    draw.rectangle([0, 0, preview.width, rect_height], fill=(0, 0, 0))
+    y = padding
+    for line in status_lines:
+        draw.text((padding, y), line, fill=(255, 255, 255), font=font)
+        y += line_height
+    return _pil_to_tensor(preview)
+
+
+class ImageLoopbackCache(io.ComfyNode):
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "input_image": (
-                    "IMAGE", 
-                    {}
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="Image-Loopback-Cache",
+            display_name="Cache Image For Loopback",
+            category="Utility",
+            inputs=[
+                io.Image.Input("input_image", tooltip="Image to store as the loopback cache."),
+                io.String.Input(
+                    "cache_path",
+                    default="loopback_cache",
+                    multiline=False,
+                    tooltip="Relative cache folder under the node directory.",
                 ),
-                "cache_path": ( 
-                    "STRING", {
-                        "multiline": False, 
-                        "default": "loopback_cache"
-                    },
+                io.Boolean.Input(
+                    "caching_enabled",
+                    default=True,
+                    tooltip="Disable to skip writing the cached image.",
                 ),
-                "caching_enabled": (
-                    "BOOLEAN", {
-                        "default": True
-                    }
-                )
-            },
-        }
-    
-    RETURN_TYPES = ()
-    RETURN_NAMES = ()
-    OUTPUT_NODE = True
-    CATEGORY = "Utility"
-    FUNCTION = "cache_image"
+            ],
+            outputs=[],
+            is_output_node=True,
+        )
 
-    def cache_image(self, input_image, cache_path: str, caching_enabled):
-        # Check if caching is enabled
+    @classmethod
+    def execute(cls, input_image, cache_path: str, caching_enabled: bool) -> io.NodeOutput:
         if not caching_enabled:
-            return ()
+            return io.NodeOutput()
 
-        # Create the cache directory if it doesn't exist
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        cache_dir = os.path.join(current_dir, cache_path)
-        if not os.path.exists(cache_dir):
-            os.makedirs(cache_dir)
-
-        # Set the cache image path
+        cache_dir = _cache_dir(cache_path)
+        os.makedirs(cache_dir, exist_ok=True)
         image_path = os.path.join(cache_dir, "cached_img.png")
 
-        # Convert the PyTorch tensor to a PIL Image
-        img = input_image.squeeze()
-        img = (img * 255).clamp(0, 255).byte().cpu().numpy()
-        if img.shape[2] == 4:
-            image = Image.fromarray(img, 'RGBA')
-        else:
-            image = Image.fromarray(img, 'RGB')
-
-        #  Check if the previously cached image is the same as the current image
+        image = _tensor_to_pil(input_image)
         if os.path.exists(image_path):
-            cached_image = Image.open(image_path)
-            cached_array = np.array(cached_image)
-            current_array = np.array(image)
-            if np.array_equal(cached_array, current_array):
-                return ()
+            try:
+                with Image.open(image_path) as cached_image:
+                    if np.array_equal(np.array(cached_image), np.array(image)):
+                        return io.NodeOutput()
+            except OSError:
+                pass
 
-        # Save the image to the cache directory
-        if os.path.exists(image_path):
-            os.remove(image_path)
         image.save(image_path)
-        
-        # Return an empty tuple
-        return ()
-    
-class ImageLoopbackLoad:
+        return io.NodeOutput()
+
+
+class ImageLoopbackLoad(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="Image-Loopback-Load",
+            display_name="Load Image For Loopback",
+            category="Utility",
+            inputs=[
+                io.String.Input(
+                    "cache_path",
+                    default="loopback_cache",
+                    multiline=False,
+                    tooltip="Relative cache folder under the node directory.",
+                ),
+                io.Boolean.Input(
+                    "update_from_cache",
+                    default=True,
+                    tooltip="If disabled, reuse the last loaded image from disk.",
+                ),
+                io.Image.Input(
+                    "starting_image",
+                    optional=True,
+                    tooltip="Optional image to seed the cache when none exists.",
+                ),
+            ],
+            outputs=[io.Image.Output()],
+        )
 
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "cache_path": (
-                    "STRING", {
-                        "multiline": False,
-                        "default": "loopback_cache"
-                    },
-                ),
-                "update_from_cache": (
-                    "BOOLEAN", {
-                        "default": True
-                    }
-                )
-            },
-        }    
-        
-    def load_loopback_image(self, cache_path: str, update_from_cache: bool):
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        cache_dir = os.path.join(current_dir, cache_path)
+    def execute(
+        cls,
+        cache_path: str,
+        update_from_cache: bool,
+        starting_image: torch.Tensor | None = None,
+    ) -> io.NodeOutput:
+        cache_dir = _cache_dir(cache_path)
         cached_image_path = os.path.join(cache_dir, "cached_img.png")
         current_image_path = os.path.join(cache_dir, "current_img.png")
 
-        # Check if updating from cache is enabled; if it's not, return the same image used in the previous execution.
-        # The idea is to make sure that unnecessary re-executions aren't triggered by the cache updating its return value
-        # when it doesn't have to. 
-        if not update_from_cache:
-            current_img = Image.open(current_image_path)
-            current_img = np.array(current_img).astype(np.float32) / 255.0
-            current_img = torch.from_numpy(current_img).unsqueeze(0)
+        cache_exists = os.path.exists(cached_image_path)
+        current_exists = os.path.exists(current_image_path)
+        cache_had_image = cache_exists
+        source = "unknown"
 
-            return (current_img,)
-
+        if update_from_cache:
+            if cache_exists:
+                image = _load_tensor_image(cached_image_path)
+                source = "cached"
+                _save_tensor_image(image, current_image_path)
+                current_exists = True
+            elif starting_image is not None:
+                image = _ensure_batch(starting_image)
+                source = "starting"
+                _save_tensor_image(image, current_image_path)
+                _save_tensor_image(image, cached_image_path)
+                cache_exists = True
+                current_exists = True
+            elif current_exists:
+                image = _load_tensor_image(current_image_path)
+                source = "current"
+            else:
+                raise FileNotFoundError(
+                    "No cached image found. Provide a starting_image or run the cache node first."
+                )
         else:
-            # Keep a second copy of the image saved so that we can return it for 
-            # subsequent executions if update_from_cache is disabled. We can continue
-            # to update cached_image to the latest image, but in case the next execution
-            # doesn't want to update the cached image, we can still return this current image.
-            cached_img = Image.open(cached_image_path)
-            current_img = cached_img.copy()
-            current_img.save(current_image_path)
+            if current_exists:
+                image = _load_tensor_image(current_image_path)
+                source = "current"
+            elif cache_exists:
+                image = _load_tensor_image(cached_image_path)
+                source = "cached"
+                _save_tensor_image(image, current_image_path)
+                current_exists = True
+            elif starting_image is not None:
+                image = _ensure_batch(starting_image)
+                source = "starting"
+                _save_tensor_image(image, current_image_path)
+                _save_tensor_image(image, cached_image_path)
+                cache_exists = True
+                current_exists = True
+            else:
+                raise FileNotFoundError(
+                    "No cached image found. Provide a starting_image or run the cache node first."
+                )
 
-            # Convert the PIL Image to a PyTorch tensor, normalize it, and return it
-            current_img = Image.open(current_image_path)
-            current_img = np.array(current_img).astype(np.float32) / 255.0
-            current_img = torch.from_numpy(current_img).unsqueeze(0)
+        status_lines = [
+            f"cache: {'present' if cache_had_image else 'missing'}",
+            f"source: {source}",
+            f"update_from_cache: {update_from_cache}",
+        ]
+        preview_image = _make_status_preview(image, status_lines)
+        return io.NodeOutput(image, ui=ui.PreviewImage(preview_image, cls=cls))
 
-            return (current_img,)
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("loopback_image",)
-    CATEGORY = "Utility"
-    FUNCTION = "load_loopback_image"
+class ImageLoopbackExtension(ComfyExtension):
+    async def get_node_list(self) -> list[type[io.ComfyNode]]:
+        return [ImageLoopbackCache, ImageLoopbackLoad]
 
-# A dictionary that contains all nodes you want to export with their names
-# NOTE: names should be globally unique
-NODE_CLASS_MAPPINGS = {
-    "Image-Loopback-Cache": ImageLoopbackCache, 
-    "Image-Loopback-Load": ImageLoopbackLoad
-    }
 
-# A dictionary that contains the friendly/humanly readable titles for the nodes
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "Image-Loopback-Cache": "Cache Image For Loopback",
-    "Image-Loopback-Load": "Load Image For Loopback",
-}
+async def comfy_entrypoint() -> ComfyExtension:
+    return ImageLoopbackExtension()
