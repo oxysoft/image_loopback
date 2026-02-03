@@ -98,3 +98,6 @@ cookiecutter-pypackage-env/
 # vscode settings
 .history/
 *.code-workspace
+
+# Local image loopback cache artifacts
+src/image_loopback/loopback_cache/
