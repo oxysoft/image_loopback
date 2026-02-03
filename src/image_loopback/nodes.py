@@ -1,4 +1,6 @@
 from PIL import Image, ImageDraw, ImageFont
+import hashlib
+import json
 import os
 import numpy as np
 import torch
@@ -11,14 +13,34 @@ HISTORY_DIR_NAME = "history"
 HISTORY_INDEX_FILE = "history_index.txt"
 
 
-def _cache_dir(cache_path: str) -> str:
+def _workflow_key_from_hidden(prompt: object | None, extra_pnginfo: object | None) -> str:
+    payload = None
+    if isinstance(extra_pnginfo, dict) and "workflow" in extra_pnginfo:
+        payload = extra_pnginfo.get("workflow")
+    if payload is None:
+        payload = prompt if prompt is not None else {}
+    try:
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    except (TypeError, ValueError):
+        canonical = json.dumps(str(payload), ensure_ascii=True)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+    return f"wf_{digest}"
+
+
+def _cache_dir(cache_path: str, workflow_key: str) -> str:
+    workflow_key = workflow_key or "wf_default"
     if os.path.isabs(cache_path):
-        return cache_path
-    base_dir = os.path.abspath(os.path.join(folder_paths.get_temp_directory(), "image_loopback"))
-    os.makedirs(base_dir, exist_ok=True)
-    candidate = os.path.abspath(os.path.normpath(os.path.join(base_dir, cache_path)))
-    if not (candidate == base_dir or candidate.startswith(base_dir + os.sep)):
-        return base_dir
+        base_root = os.path.abspath(os.path.join(cache_path, workflow_key))
+        os.makedirs(base_root, exist_ok=True)
+        return base_root
+
+    base_root = os.path.abspath(
+        os.path.join(folder_paths.get_temp_directory(), "image_loopback", workflow_key)
+    )
+    os.makedirs(base_root, exist_ok=True)
+    candidate = os.path.abspath(os.path.normpath(os.path.join(base_root, cache_path)))
+    if not (candidate == base_root or candidate.startswith(base_root + os.sep)):
+        return base_root
     return candidate
 
 
@@ -171,6 +193,13 @@ def _parse_history_indices(spec: str) -> list[int]:
     return indices
 
 
+def _node_workflow_key(node_cls) -> str:
+    hidden = getattr(node_cls, "hidden", None)
+    prompt = getattr(hidden, "prompt", None) if hidden is not None else None
+    extra_pnginfo = getattr(hidden, "extra_pnginfo", None) if hidden is not None else None
+    return _workflow_key_from_hidden(prompt, extra_pnginfo)
+
+
 class ImageLoopbackCache(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
@@ -184,7 +213,10 @@ class ImageLoopbackCache(io.ComfyNode):
                     "cache_path",
                     default="loopback_cache",
                     multiline=False,
-                    tooltip="Subfolder under ComfyUI temp/image_loopback (or absolute path).",
+                    tooltip=(
+                        "Subfolder under this workflow's temp cache. "
+                        "Use different values for independent buffers."
+                    ),
                 ),
                 io.Int.Input(
                     "history_limit",
@@ -213,7 +245,8 @@ class ImageLoopbackCache(io.ComfyNode):
         if not caching_enabled:
             return io.NodeOutput()
 
-        cache_dir = _cache_dir(cache_path)
+        workflow_key = _node_workflow_key(cls)
+        cache_dir = _cache_dir(cache_path, workflow_key)
         os.makedirs(cache_dir, exist_ok=True)
         image_path = os.path.join(cache_dir, "cached_img.png")
 
@@ -243,7 +276,10 @@ class ImageLoopbackLoad(io.ComfyNode):
                     "cache_path",
                     default="loopback_cache",
                     multiline=False,
-                    tooltip="Subfolder under ComfyUI temp/image_loopback (or absolute path).",
+                    tooltip=(
+                        "Subfolder under this workflow's temp cache. "
+                        "Use different values for independent buffers."
+                    ),
                 ),
                 io.Boolean.Input(
                     "update_from_cache",
@@ -263,6 +299,7 @@ class ImageLoopbackLoad(io.ComfyNode):
                 ),
             ],
             outputs=[io.Image.Output()],
+            hidden=[io.Hidden.prompt, io.Hidden.extra_pnginfo],
         )
 
     @classmethod
@@ -274,7 +311,8 @@ class ImageLoopbackLoad(io.ComfyNode):
         starting_image: torch.Tensor | None = None,
     ) -> io.NodeOutput:
         requested_history = _parse_history_indices(history_indices)
-        cache_dir = _cache_dir(cache_path)
+        workflow_key = _node_workflow_key(cls)
+        cache_dir = _cache_dir(cache_path, workflow_key)
         cached_image_path = os.path.join(cache_dir, "cached_img.png")
         current_image_path = os.path.join(cache_dir, "current_img.png")
 
@@ -357,12 +395,15 @@ class ImageLoopbackLoad(io.ComfyNode):
             source = f"history[{history_indices.strip()}]"
 
         status_lines = [
+            f"wf: {workflow_key}",
             f"cache: {'present' if cache_had_image else 'missing'}",
             f"source: {source}",
             f"update_from_cache: {update_from_cache}",
         ]
         if requested_history:
             status_lines.append(f"history: {history_indices.strip()}")
+        if output_image.dim() == 4 and output_image.shape[0] > 1:
+            status_lines.append(f"batch: {output_image.shape[0]}")
         preview_image = _make_status_preview(output_image, status_lines)
         return io.NodeOutput(output_image, ui=ui.PreviewImage(preview_image, cls=cls))
 
