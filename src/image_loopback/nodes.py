@@ -6,6 +6,10 @@ import torch
 from comfy_api.latest import ComfyExtension, io, ui
 import folder_paths
 
+DEFAULT_HISTORY_LIMIT = 64
+HISTORY_DIR_NAME = "history"
+HISTORY_INDEX_FILE = "history_index.txt"
+
 
 def _cache_dir(cache_path: str) -> str:
     if os.path.isabs(cache_path):
@@ -16,6 +20,68 @@ def _cache_dir(cache_path: str) -> str:
     if not (candidate == base_dir or candidate.startswith(base_dir + os.sep)):
         return base_dir
     return candidate
+
+
+def _history_dir(cache_dir: str) -> str:
+    return os.path.join(cache_dir, HISTORY_DIR_NAME)
+
+
+def _history_path(history_dir: str, index: int) -> str:
+    return os.path.join(history_dir, f"history_{index:06d}.png")
+
+
+def _read_history_index(history_dir: str) -> int:
+    index_path = os.path.join(history_dir, HISTORY_INDEX_FILE)
+    if not os.path.exists(index_path):
+        return 0
+    try:
+        with open(index_path, "r", encoding="utf-8") as handle:
+            return int(handle.read().strip() or 0)
+    except (OSError, ValueError):
+        return 0
+
+
+def _write_history_index(history_dir: str, index: int) -> None:
+    os.makedirs(history_dir, exist_ok=True)
+    index_path = os.path.join(history_dir, HISTORY_INDEX_FILE)
+    with open(index_path, "w", encoding="utf-8") as handle:
+        handle.write(str(index))
+
+
+def _list_history_entries(history_dir: str) -> list[tuple[int, str]]:
+    if not os.path.isdir(history_dir):
+        return []
+    entries: list[tuple[int, str]] = []
+    for name in os.listdir(history_dir):
+        if not (name.startswith("history_") and name.endswith(".png")):
+            continue
+        raw = name[len("history_") : -len(".png")]
+        if not raw.isdigit():
+            continue
+        index = int(raw)
+        entries.append((index, os.path.join(history_dir, name)))
+    entries.sort(key=lambda item: item[0])
+    return entries
+
+
+def _append_history(image: torch.Tensor, cache_dir: str, history_limit: int) -> None:
+    history_dir = _history_dir(cache_dir)
+    os.makedirs(history_dir, exist_ok=True)
+    next_index = _read_history_index(history_dir) + 1
+    _save_tensor_image(image, _history_path(history_dir, next_index))
+    _write_history_index(history_dir, next_index)
+
+    if history_limit <= 0:
+        return
+    entries = _list_history_entries(history_dir)
+    if len(entries) <= history_limit:
+        return
+    excess = entries[:-history_limit]
+    for _, path in excess:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 def _ensure_batch(image: torch.Tensor) -> torch.Tensor:
@@ -73,6 +139,38 @@ def _make_status_preview(image: torch.Tensor, status_lines: list[str]) -> torch.
     return _pil_to_tensor(preview)
 
 
+def _parse_history_indices(spec: str) -> list[int]:
+    if spec is None:
+        return []
+    spec = spec.strip()
+    if not spec:
+        return []
+    parts = [part.strip() for part in spec.split(",") if part.strip()]
+    indices: list[int] = []
+    for part in parts:
+        if "-" in part:
+            bounds = [item.strip() for item in part.split("-", maxsplit=1)]
+            if len(bounds) != 2 or not bounds[0] or not bounds[1]:
+                raise ValueError(f"Invalid history range: '{part}'.")
+            try:
+                start = int(bounds[0])
+                end = int(bounds[1])
+            except ValueError as exc:
+                raise ValueError(f"Invalid history range: '{part}'.") from exc
+            step = 1 if end >= start else -1
+            indices.extend(list(range(start, end + step, step)))
+        else:
+            try:
+                indices.append(int(part))
+            except ValueError as exc:
+                raise ValueError(f"Invalid history index: '{part}'.") from exc
+    if any(index == 0 for index in indices):
+        raise ValueError("History index 0 is invalid (cannot sample the current run).")
+    if any(index < 0 for index in indices):
+        raise ValueError("History indices must be positive integers.")
+    return indices
+
+
 class ImageLoopbackCache(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
@@ -88,6 +186,12 @@ class ImageLoopbackCache(io.ComfyNode):
                     multiline=False,
                     tooltip="Subfolder under ComfyUI temp/image_loopback (or absolute path).",
                 ),
+                io.Int.Input(
+                    "history_limit",
+                    default=DEFAULT_HISTORY_LIMIT,
+                    min=0,
+                    tooltip="Number of cached frames to keep (0 keeps everything).",
+                ),
                 io.Boolean.Input(
                     "caching_enabled",
                     default=True,
@@ -99,7 +203,13 @@ class ImageLoopbackCache(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, input_image, cache_path: str, caching_enabled: bool) -> io.NodeOutput:
+    def execute(
+        cls,
+        input_image,
+        cache_path: str,
+        history_limit: int,
+        caching_enabled: bool,
+    ) -> io.NodeOutput:
         if not caching_enabled:
             return io.NodeOutput()
 
@@ -117,6 +227,7 @@ class ImageLoopbackCache(io.ComfyNode):
                 pass
 
         image.save(image_path)
+        _append_history(input_image, cache_dir, history_limit)
         return io.NodeOutput()
 
 
@@ -139,6 +250,12 @@ class ImageLoopbackLoad(io.ComfyNode):
                     default=True,
                     tooltip="If disabled, reuse the last loaded image from disk.",
                 ),
+                io.String.Input(
+                    "history_indices",
+                    default="",
+                    multiline=False,
+                    tooltip="Indices or ranges (e.g. '1,3-4') for past frames; 0 is invalid.",
+                ),
                 io.Image.Input(
                     "starting_image",
                     optional=True,
@@ -153,8 +270,10 @@ class ImageLoopbackLoad(io.ComfyNode):
         cls,
         cache_path: str,
         update_from_cache: bool,
+        history_indices: str,
         starting_image: torch.Tensor | None = None,
     ) -> io.NodeOutput:
+        requested_history = _parse_history_indices(history_indices)
         cache_dir = _cache_dir(cache_path)
         cached_image_path = os.path.join(cache_dir, "cached_img.png")
         current_image_path = os.path.join(cache_dir, "current_img.png")
@@ -177,6 +296,7 @@ class ImageLoopbackLoad(io.ComfyNode):
                 _save_tensor_image(image, cached_image_path)
                 cache_exists = True
                 current_exists = True
+                _append_history(image, cache_dir, DEFAULT_HISTORY_LIMIT)
             elif current_exists:
                 image = _load_tensor_image(current_image_path)
                 source = "current"
@@ -200,18 +320,51 @@ class ImageLoopbackLoad(io.ComfyNode):
                 _save_tensor_image(image, cached_image_path)
                 cache_exists = True
                 current_exists = True
+                _append_history(image, cache_dir, DEFAULT_HISTORY_LIMIT)
             else:
                 raise FileNotFoundError(
                     "No cached image found. Provide a starting_image or run the cache node first."
                 )
+
+        output_image = image
+        if requested_history:
+            history_dir = _history_dir(cache_dir)
+            history_entries = _list_history_entries(history_dir)
+            total_available = len(history_entries) if history_entries else 1
+            missing = [index for index in requested_history if index > total_available]
+            if missing:
+                raise ValueError(
+                    f"History only has {total_available} frame(s); requested {missing}."
+                )
+
+            selected: list[torch.Tensor] = []
+            if history_entries:
+                for index in requested_history:
+                    _, path = history_entries[-index]
+                    selected.append(_load_tensor_image(path))
+            else:
+                for index in requested_history:
+                    if index != 1:
+                        raise ValueError(
+                            f"History only has 1 frame; requested {index}."
+                        )
+                    selected.append(image)
+
+            base_shape = selected[0].shape
+            if any(tensor.shape != base_shape for tensor in selected):
+                raise ValueError("Selected history frames have mismatched shapes.")
+            output_image = torch.cat(selected, dim=0)
+            source = f"history[{history_indices.strip()}]"
 
         status_lines = [
             f"cache: {'present' if cache_had_image else 'missing'}",
             f"source: {source}",
             f"update_from_cache: {update_from_cache}",
         ]
-        preview_image = _make_status_preview(image, status_lines)
-        return io.NodeOutput(image, ui=ui.PreviewImage(preview_image, cls=cls))
+        if requested_history:
+            status_lines.append(f"history: {history_indices.strip()}")
+        preview_image = _make_status_preview(output_image, status_lines)
+        return io.NodeOutput(output_image, ui=ui.PreviewImage(preview_image, cls=cls))
 
 
 class ImageLoopbackExtension(ComfyExtension):
