@@ -4,11 +4,18 @@ import numpy as np
 import torch
 
 from comfy_api.latest import ComfyExtension, io, ui
+import folder_paths
 
 
 def _cache_dir(cache_path: str) -> str:
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(current_dir, cache_path)
+    if os.path.isabs(cache_path):
+        return cache_path
+    base_dir = os.path.abspath(os.path.join(folder_paths.get_temp_directory(), "image_loopback"))
+    os.makedirs(base_dir, exist_ok=True)
+    candidate = os.path.abspath(os.path.normpath(os.path.join(base_dir, cache_path)))
+    if not (candidate == base_dir or candidate.startswith(base_dir + os.sep)):
+        return base_dir
+    return candidate
 
 
 def _ensure_batch(image: torch.Tensor) -> torch.Tensor:
@@ -79,7 +86,7 @@ class ImageLoopbackCache(io.ComfyNode):
                     "cache_path",
                     default="loopback_cache",
                     multiline=False,
-                    tooltip="Relative cache folder under the node directory.",
+                    tooltip="Subfolder under ComfyUI temp/image_loopback (or absolute path).",
                 ),
                 io.Boolean.Input(
                     "caching_enabled",
@@ -125,7 +132,7 @@ class ImageLoopbackLoad(io.ComfyNode):
                     "cache_path",
                     default="loopback_cache",
                     multiline=False,
-                    tooltip="Relative cache folder under the node directory.",
+                    tooltip="Subfolder under ComfyUI temp/image_loopback (or absolute path).",
                 ),
                 io.Boolean.Input(
                     "update_from_cache",
