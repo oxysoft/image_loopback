@@ -7,6 +7,7 @@ import torch
 
 from comfy_api.latest import ComfyExtension, io, ui
 import folder_paths
+import comfy.utils
 
 DEFAULT_HISTORY_LIMIT = 64
 HISTORY_DIR_NAME = "history"
@@ -237,6 +238,60 @@ def _node_workflow_key(node_cls) -> str:
     return _workflow_key_from_hidden(prompt, extra_pnginfo)
 
 
+def _batch_images(images: list[torch.Tensor]) -> torch.Tensor:
+    if len(images) == 0:
+        raise ValueError("No images provided for batching.")
+    max_channels = max(image.shape[-1] for image in images)
+    padded_images: list[torch.Tensor] = []
+    for image in images:
+        if image.shape[-1] < max_channels:
+            padded_images.append(torch.nn.functional.pad(image, (0, 1), mode="constant", value=1.0))
+        else:
+            padded_images.append(image)
+    resized_images: list[torch.Tensor] = []
+    first_image_shape = padded_images[0].shape
+    for image in padded_images:
+        if image.shape[1:] != first_image_shape[1:]:
+            resized_images.append(
+                comfy.utils.common_upscale(
+                    image.movedim(-1, 1),
+                    first_image_shape[2],
+                    first_image_shape[1],
+                    "bilinear",
+                    "center",
+                ).movedim(1, -1)
+            )
+        else:
+            resized_images.append(image)
+    return torch.cat(resized_images, dim=0)
+
+
+def _make_placeholder_tensor(
+    width: int,
+    height: int,
+    mode: str,
+) -> torch.Tensor:
+    if width <= 0 or height <= 0:
+        raise ValueError("Placeholder dimensions must be positive.")
+    if mode == "transparent":
+        image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    elif mode == "white":
+        image = Image.new("RGB", (width, height), (255, 255, 255))
+    elif mode == "gray":
+        image = Image.new("RGB", (width, height), (64, 64, 64))
+    elif mode == "checkerboard":
+        image = Image.new("RGB", (width, height), (48, 48, 48))
+        draw = ImageDraw.Draw(image)
+        tile = max(16, min(width, height) // 8)
+        for y in range(0, height, tile):
+            for x in range(0, width, tile):
+                if (x // tile + y // tile) % 2 == 0:
+                    draw.rectangle([x, y, x + tile - 1, y + tile - 1], fill=(96, 96, 96))
+    else:
+        image = Image.new("RGB", (width, height), (0, 0, 0))
+    return _pil_to_tensor(image)
+
+
 class ImageLoopbackCache(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
@@ -329,6 +384,24 @@ class ImageLoopbackLoad(io.ComfyNode):
                     multiline=False,
                     tooltip="Indices or ranges (e.g. '1,3-4') for past frames; 0 is invalid.",
                 ),
+                io.Combo.Input(
+                    "empty_mode",
+                    options=["error", "checkerboard", "black", "gray", "white", "transparent"],
+                    default="checkerboard",
+                    tooltip="What to output when requested frames are missing.",
+                ),
+                io.Int.Input(
+                    "empty_width",
+                    default=512,
+                    min=16,
+                    tooltip="Width for empty frames when no reference image exists.",
+                ),
+                io.Int.Input(
+                    "empty_height",
+                    default=512,
+                    min=16,
+                    tooltip="Height for empty frames when no reference image exists.",
+                ),
                 io.Image.Input(
                     "starting_image",
                     optional=True,
@@ -340,11 +413,35 @@ class ImageLoopbackLoad(io.ComfyNode):
         )
 
     @classmethod
+    def validate_inputs(
+        cls,
+        cache_path: str,
+        update_from_cache: bool,
+        history_indices: str,
+        empty_mode: str,
+        empty_width: int,
+        empty_height: int,
+        starting_image: torch.Tensor | None = None,
+    ) -> bool | str:
+        try:
+            _parse_history_indices(history_indices)
+        except ValueError as exc:
+            return str(exc)
+        if empty_mode not in {"error", "checkerboard", "black", "gray", "white", "transparent"}:
+            return f"Invalid empty_mode '{empty_mode}'."
+        if empty_width <= 0 or empty_height <= 0:
+            return "empty_width and empty_height must be positive."
+        return True
+
+    @classmethod
     def execute(
         cls,
         cache_path: str,
         update_from_cache: bool,
         history_indices: str,
+        empty_mode: str,
+        empty_width: int,
+        empty_height: int,
         starting_image: torch.Tensor | None = None,
     ) -> io.NodeOutput:
         requested_history = _parse_history_indices(history_indices)
@@ -357,6 +454,7 @@ class ImageLoopbackLoad(io.ComfyNode):
         current_exists = os.path.exists(current_image_path)
         cache_had_image = cache_exists
         source = "unknown"
+        empty_mode = (empty_mode or "error").lower()
 
         if update_from_cache:
             if cache_exists:
@@ -376,9 +474,12 @@ class ImageLoopbackLoad(io.ComfyNode):
                 image = _load_tensor_image(current_image_path)
                 source = "current"
             else:
-                raise FileNotFoundError(
-                    "No cached image found. Provide a starting_image or run the cache node first."
-                )
+                if empty_mode == "error":
+                    raise FileNotFoundError(
+                        "No cached image found. Provide a starting_image or run the cache node first."
+                    )
+                image = _make_placeholder_tensor(empty_width, empty_height, empty_mode)
+                source = "empty"
         else:
             if current_exists:
                 image = _load_tensor_image(current_image_path)
@@ -397,38 +498,41 @@ class ImageLoopbackLoad(io.ComfyNode):
                 current_exists = True
                 _append_history(image, cache_dir, DEFAULT_HISTORY_LIMIT)
             else:
-                raise FileNotFoundError(
-                    "No cached image found. Provide a starting_image or run the cache node first."
-                )
+                if empty_mode == "error":
+                    raise FileNotFoundError(
+                        "No cached image found. Provide a starting_image or run the cache node first."
+                    )
+                image = _make_placeholder_tensor(empty_width, empty_height, empty_mode)
+                source = "empty"
 
         output_image = image
+        placeholder_used = source == "empty"
+        frame_labels = None
         if requested_history:
             history_dir = _history_dir(cache_dir)
             history_entries = _list_history_entries(history_dir)
-            total_available = len(history_entries) if history_entries else 1
-            missing = [index for index in requested_history if index > total_available]
-            if missing:
-                raise ValueError(
-                    f"History only has {total_available} frame(s); requested {missing}."
-                )
-
+            total_available = len(history_entries)
             selected: list[torch.Tensor] = []
-            if history_entries:
-                for index in requested_history:
+            frame_labels = []
+            for index in requested_history:
+                if total_available and index <= total_available:
                     _, path = history_entries[-index]
                     selected.append(_load_tensor_image(path))
-            else:
-                for index in requested_history:
-                    if index != 1:
-                        raise ValueError(
-                            f"History only has 1 frame; requested {index}."
-                        )
-                    selected.append(image)
+                    frame_labels.append(f"t-{index}")
+                elif empty_mode == "error":
+                    raise ValueError(
+                        f"History only has {total_available} frame(s); requested t-{index}."
+                    )
+                else:
+                    ref = image
+                    ref_batch = _ensure_batch(ref)
+                    height = ref_batch.shape[1] if ref_batch.dim() == 4 else empty_height
+                    width = ref_batch.shape[2] if ref_batch.dim() == 4 else empty_width
+                    selected.append(_make_placeholder_tensor(width, height, empty_mode))
+                    frame_labels.append(f"t-{index} empty")
+                    placeholder_used = True
 
-            base_shape = selected[0].shape
-            if any(tensor.shape != base_shape for tensor in selected):
-                raise ValueError("Selected history frames have mismatched shapes.")
-            output_image = torch.cat(selected, dim=0)
+            output_image = _batch_images(selected)
             source = f"history[{history_indices.strip()}]"
 
         status_lines = [
@@ -437,13 +541,12 @@ class ImageLoopbackLoad(io.ComfyNode):
             f"source: {source}",
             f"update_from_cache: {update_from_cache}",
         ]
+        if placeholder_used:
+            status_lines.append(f"empty_mode: {empty_mode}")
         if requested_history:
             status_lines.append(f"history: {history_indices.strip()}")
         if output_image.dim() == 4 and output_image.shape[0] > 1:
             status_lines.append(f"batch: {output_image.shape[0]}")
-        frame_labels = None
-        if requested_history:
-            frame_labels = [f"t-{index}" for index in requested_history]
         preview_image = _make_status_preview(output_image, status_lines, frame_labels)
         preview_ui = ui.PreviewImage(preview_image, cls=cls)
         status_text_lines = list(status_lines)
