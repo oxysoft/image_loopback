@@ -145,8 +145,12 @@ def _load_tensor_image(path: str) -> torch.Tensor:
         return _pil_to_tensor(img)
 
 
-def _make_status_preview(image: torch.Tensor, status_lines: list[str]) -> torch.Tensor:
-    preview = _tensor_to_pil(image).convert("RGB")
+def _draw_status_overlay(
+    preview: Image.Image,
+    status_lines: list[str],
+    frame_label: str | None = None,
+) -> Image.Image:
+    preview = preview.convert("RGB")
     draw = ImageDraw.Draw(preview)
     font = ImageFont.load_default()
     padding = 6
@@ -158,7 +162,40 @@ def _make_status_preview(image: torch.Tensor, status_lines: list[str]) -> torch.
     for line in status_lines:
         draw.text((padding, y), line, fill=(255, 255, 255), font=font)
         y += line_height
-    return _pil_to_tensor(preview)
+
+    if frame_label:
+        label_text = frame_label
+        label_bbox = draw.textbbox((0, 0), label_text, font=font)
+        label_w = label_bbox[2] - label_bbox[0]
+        label_h = label_bbox[3] - label_bbox[1]
+        x0 = padding
+        y0 = preview.height - label_h - (padding * 2)
+        draw.rectangle(
+            [x0, y0, x0 + label_w + (padding * 2), y0 + label_h + (padding * 2)],
+            fill=(0, 0, 0),
+        )
+        draw.text((x0 + padding, y0 + padding), label_text, fill=(255, 255, 255), font=font)
+
+    return preview
+
+
+def _make_status_preview(
+    image: torch.Tensor,
+    status_lines: list[str],
+    frame_labels: list[str] | None = None,
+) -> torch.Tensor:
+    batch = _ensure_batch(image)
+    if frame_labels is None:
+        frame_labels = [None] * batch.shape[0]
+    if len(frame_labels) != batch.shape[0]:
+        raise ValueError("Frame labels must match the batch size for previews.")
+
+    previews: list[torch.Tensor] = []
+    for idx, frame in enumerate(batch):
+        preview = _tensor_to_pil(frame)
+        preview = _draw_status_overlay(preview, status_lines, frame_labels[idx])
+        previews.append(_pil_to_tensor(preview))
+    return torch.cat(previews, dim=0)
 
 
 def _parse_history_indices(spec: str) -> list[int]:
@@ -404,7 +441,10 @@ class ImageLoopbackLoad(io.ComfyNode):
             status_lines.append(f"history: {history_indices.strip()}")
         if output_image.dim() == 4 and output_image.shape[0] > 1:
             status_lines.append(f"batch: {output_image.shape[0]}")
-        preview_image = _make_status_preview(output_image, status_lines)
+        frame_labels = None
+        if requested_history:
+            frame_labels = [f"t-{index}" for index in requested_history]
+        preview_image = _make_status_preview(output_image, status_lines, frame_labels)
         return io.NodeOutput(output_image, ui=ui.PreviewImage(preview_image, cls=cls))
 
 
