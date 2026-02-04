@@ -4,14 +4,17 @@ import json
 import os
 import numpy as np
 import torch
+from aiohttp import web
 
 from comfy_api.latest import ComfyExtension, io, ui
 import folder_paths
 import comfy.utils
+from server import PromptServer
 
 DEFAULT_HISTORY_LIMIT = 64
 HISTORY_DIR_NAME = "history"
 HISTORY_INDEX_FILE = "history_index.txt"
+CONFIG_FILE_NAME = "loopback_config.json"
 
 
 def _workflow_key_from_hidden(prompt: object | None, extra_pnginfo: object | None) -> str:
@@ -70,6 +73,38 @@ def _write_history_index(history_dir: str, index: int) -> None:
     with open(index_path, "w", encoding="utf-8") as handle:
         handle.write(str(index))
 
+
+def _config_path(cache_dir: str) -> str:
+    return os.path.join(cache_dir, CONFIG_FILE_NAME)
+
+
+def _read_config(cache_dir: str) -> dict:
+    path = _config_path(cache_dir)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+            return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _write_config(cache_dir: str, data: dict) -> None:
+    os.makedirs(cache_dir, exist_ok=True)
+    path = _config_path(cache_dir)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, sort_keys=True, indent=2)
+
+
+def _effective_history_limit(cache_dir: str, override: int | None = None) -> int:
+    if override is not None and override >= 0:
+        return override
+    config = _read_config(cache_dir)
+    value = config.get("history_limit", DEFAULT_HISTORY_LIMIT)
+    if isinstance(value, int) and value >= 0:
+        return value
+    return DEFAULT_HISTORY_LIMIT
 
 def _list_history_entries(history_dir: str) -> list[tuple[int, str]]:
     if not os.path.isdir(history_dir):
@@ -292,12 +327,105 @@ def _make_placeholder_tensor(
     return _pil_to_tensor(image)
 
 
+# -----------------------------------------------------------------------------
+# Live preview API endpoint - allows JS to query cached frames without execution
+# -----------------------------------------------------------------------------
+@PromptServer.instance.routes.post("/image_loopback/preview_cache")
+async def preview_cache_handler(request):
+    """
+    Returns available history frame URLs for live preview in the UI.
+
+    POST body (JSON):
+        workflow: dict - the current workflow JSON (used to compute workflow_key)
+        cache_path: str - the cache path input value
+        history_indices: str - indices to preview (e.g. "1,2,3" or "1-3")
+
+    Returns:
+        JSON with:
+            workflow_key: str - computed workflow key
+            frames: list[dict] - frame info for each requested index
+                Each frame: {index, exists, filename, subfolder, type}
+            total_history: int - total frames in history
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    workflow = data.get("workflow", {})
+    cache_path = data.get("cache_path", "loopback_cache")
+    history_indices_str = data.get("history_indices", "")
+
+    # Compute workflow key from workflow JSON
+    workflow_key = _workflow_key_from_hidden(None, {"workflow": workflow})
+
+    # Get cache directory
+    cache_directory = _cache_dir(cache_path, workflow_key)
+    history_directory = _history_dir(cache_directory)
+
+    # List available history entries
+    history_entries = _list_history_entries(history_directory)
+    current_index = _read_history_index(history_directory)
+    total_history = len(history_entries)
+
+    # Build a map of available frames by their relative index (1 = most recent, etc.)
+    # Frames are ordered by index descending (most recent first)
+    sorted_entries = sorted(history_entries, key=lambda x: x[0], reverse=True)
+    available_frames = {}  # relative_index -> (absolute_index, path)
+    for rel_idx, (abs_idx, path) in enumerate(sorted_entries, start=1):
+        available_frames[rel_idx] = (abs_idx, path)
+
+    # Parse requested indices
+    try:
+        requested_indices = _parse_history_indices(history_indices_str)
+    except ValueError:
+        requested_indices = []
+
+    # If no indices specified, show frame 1 by default (most recent)
+    if not requested_indices:
+        requested_indices = [1] if total_history > 0 else []
+
+    # Build response frames
+    frames = []
+    temp_dir = folder_paths.get_temp_directory()
+
+    for rel_idx in requested_indices:
+        if rel_idx in available_frames:
+            abs_idx, path = available_frames[rel_idx]
+            # Make path relative to temp directory for the view endpoint
+            rel_path = os.path.relpath(path, temp_dir)
+            subfolder = os.path.dirname(rel_path)
+            filename = os.path.basename(rel_path)
+            frames.append({
+                "index": rel_idx,
+                "exists": True,
+                "filename": filename,
+                "subfolder": subfolder,
+                "type": "temp",
+            })
+        else:
+            frames.append({
+                "index": rel_idx,
+                "exists": False,
+                "filename": None,
+                "subfolder": None,
+                "type": None,
+            })
+
+    return web.json_response({
+        "workflow_key": workflow_key,
+        "frames": frames,
+        "total_history": total_history,
+        "current_index": current_index,
+    })
+
+
 class ImageLoopbackCache(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
         return io.Schema(
             node_id="Image-Loopback-Cache",
-            display_name="Cache Image For Loopback",
+            display_name="Store Loopback",
             category="Utility",
             inputs=[
                 io.Image.Input("input_image", tooltip="Image to store as the loopback cache."),
@@ -309,12 +437,6 @@ class ImageLoopbackCache(io.ComfyNode):
                         "Subfolder under this workflow's temp cache. "
                         "Use different values for independent buffers."
                     ),
-                ),
-                io.Int.Input(
-                    "history_limit",
-                    default=DEFAULT_HISTORY_LIMIT,
-                    min=0,
-                    tooltip="Number of cached frames to keep (0 keeps everything).",
                 ),
                 io.Boolean.Input(
                     "caching_enabled",
@@ -331,7 +453,6 @@ class ImageLoopbackCache(io.ComfyNode):
         cls,
         input_image,
         cache_path: str,
-        history_limit: int,
         caching_enabled: bool,
     ) -> io.NodeOutput:
         if not caching_enabled:
@@ -339,6 +460,7 @@ class ImageLoopbackCache(io.ComfyNode):
 
         workflow_key = _node_workflow_key(cls)
         cache_dir = _cache_dir(cache_path, workflow_key)
+        history_limit = _effective_history_limit(cache_dir)
         os.makedirs(cache_dir, exist_ok=True)
         image_path = os.path.join(cache_dir, "cached_img.png")
 
@@ -361,7 +483,7 @@ class ImageLoopbackLoad(io.ComfyNode):
     def define_schema(cls) -> io.Schema:
         return io.Schema(
             node_id="Image-Loopback-Load",
-            display_name="Load Image For Loopback",
+            display_name="Load Loopback",
             category="Utility",
             inputs=[
                 io.String.Input(
@@ -384,11 +506,17 @@ class ImageLoopbackLoad(io.ComfyNode):
                     multiline=False,
                     tooltip="Indices or ranges (e.g. '1,3-4') for past frames; 0 is invalid.",
                 ),
+                io.Int.Input(
+                    "history_limit",
+                    default=-1,
+                    min=-1,
+                    tooltip="Override history limit for this workflow (-1 uses configured/default).",
+                ),
                 io.Combo.Input(
                     "empty_mode",
-                    options=["error", "checkerboard", "black", "gray", "white", "transparent"],
+                    options=["error", "skip", "checkerboard", "black", "gray", "white", "transparent"],
                     default="checkerboard",
-                    tooltip="What to output when requested frames are missing.",
+                    tooltip="What to output when requested frames are missing. 'skip' omits missing frames entirely (returns 1x1 void if all missing).",
                 ),
                 io.Int.Input(
                     "empty_width",
@@ -418,6 +546,7 @@ class ImageLoopbackLoad(io.ComfyNode):
         cache_path: str,
         update_from_cache: bool,
         history_indices: str,
+        history_limit: int,
         empty_mode: str,
         empty_width: int,
         empty_height: int,
@@ -427,8 +556,10 @@ class ImageLoopbackLoad(io.ComfyNode):
             _parse_history_indices(history_indices)
         except ValueError as exc:
             return str(exc)
-        if empty_mode not in {"error", "checkerboard", "black", "gray", "white", "transparent"}:
+        if empty_mode not in {"error", "skip", "checkerboard", "black", "gray", "white", "transparent"}:
             return f"Invalid empty_mode '{empty_mode}'."
+        if history_limit < -1:
+            return "history_limit must be -1 or a non-negative integer."
         if empty_width <= 0 or empty_height <= 0:
             return "empty_width and empty_height must be positive."
         return True
@@ -439,6 +570,7 @@ class ImageLoopbackLoad(io.ComfyNode):
         cache_path: str,
         update_from_cache: bool,
         history_indices: str,
+        history_limit: int,
         empty_mode: str,
         empty_width: int,
         empty_height: int,
@@ -447,6 +579,8 @@ class ImageLoopbackLoad(io.ComfyNode):
         requested_history = _parse_history_indices(history_indices)
         workflow_key = _node_workflow_key(cls)
         cache_dir = _cache_dir(cache_path, workflow_key)
+        if history_limit is not None and history_limit >= 0:
+            _write_config(cache_dir, {"history_limit": history_limit})
         cached_image_path = os.path.join(cache_dir, "cached_img.png")
         current_image_path = os.path.join(cache_dir, "current_img.png")
 
@@ -455,6 +589,7 @@ class ImageLoopbackLoad(io.ComfyNode):
         cache_had_image = cache_exists
         source = "unknown"
         empty_mode = (empty_mode or "error").lower()
+        history_limit_effective = _effective_history_limit(cache_dir, history_limit)
 
         if update_from_cache:
             if cache_exists:
@@ -469,7 +604,7 @@ class ImageLoopbackLoad(io.ComfyNode):
                 _save_tensor_image(image, cached_image_path)
                 cache_exists = True
                 current_exists = True
-                _append_history(image, cache_dir, DEFAULT_HISTORY_LIMIT)
+                _append_history(image, cache_dir, history_limit_effective)
             elif current_exists:
                 image = _load_tensor_image(current_image_path)
                 source = "current"
@@ -478,8 +613,10 @@ class ImageLoopbackLoad(io.ComfyNode):
                     raise FileNotFoundError(
                         "No cached image found. Provide a starting_image or run the cache node first."
                     )
-                image = _make_placeholder_tensor(empty_width, empty_height, empty_mode)
-                source = "empty"
+                # "skip" mode in non-history case returns void tensor
+                fill_mode = "transparent" if empty_mode == "skip" else empty_mode
+                image = _make_placeholder_tensor(empty_width, empty_height, fill_mode)
+                source = "void" if empty_mode == "skip" else "empty"
         else:
             if current_exists:
                 image = _load_tensor_image(current_image_path)
@@ -496,18 +633,22 @@ class ImageLoopbackLoad(io.ComfyNode):
                 _save_tensor_image(image, cached_image_path)
                 cache_exists = True
                 current_exists = True
-                _append_history(image, cache_dir, DEFAULT_HISTORY_LIMIT)
+                _append_history(image, cache_dir, history_limit_effective)
             else:
                 if empty_mode == "error":
                     raise FileNotFoundError(
                         "No cached image found. Provide a starting_image or run the cache node first."
                     )
-                image = _make_placeholder_tensor(empty_width, empty_height, empty_mode)
-                source = "empty"
+                # "skip" mode in non-history case returns void tensor
+                fill_mode = "transparent" if empty_mode == "skip" else empty_mode
+                image = _make_placeholder_tensor(empty_width, empty_height, fill_mode)
+                source = "void" if empty_mode == "skip" else "empty"
 
         output_image = image
-        placeholder_used = source == "empty"
-        frame_labels = None
+        placeholder_used = source in ("empty", "void")
+        # Label for non-history source (shown in preview)
+        frame_labels = [f"[{source}]"] if source in ("starting", "cached", "current") else None
+        skipped_indices = []
         if requested_history:
             history_dir = _history_dir(cache_dir)
             history_entries = _list_history_entries(history_dir)
@@ -523,6 +664,9 @@ class ImageLoopbackLoad(io.ComfyNode):
                     raise ValueError(
                         f"History only has {total_available} frame(s); requested t-{index}."
                     )
+                elif empty_mode == "skip":
+                    # Skip missing frames entirely
+                    skipped_indices.append(index)
                 else:
                     ref = image
                     ref_batch = _ensure_batch(ref)
@@ -532,35 +676,88 @@ class ImageLoopbackLoad(io.ComfyNode):
                     frame_labels.append(f"t-{index} empty")
                     placeholder_used = True
 
-            output_image = _batch_images(selected)
+            if selected:
+                output_image = _batch_images(selected)
+            else:
+                # All frames were skipped - return a 1x1 void tensor
+                output_image = _make_placeholder_tensor(1, 1, "transparent")
+                frame_labels = ["void"]
+                placeholder_used = True
             source = f"history[{history_indices.strip()}]"
 
         status_lines = [
             f"wf: {workflow_key}",
             f"cache: {'present' if cache_had_image else 'missing'}",
             f"source: {source}",
-            f"update_from_cache: {update_from_cache}",
         ]
         if placeholder_used:
             status_lines.append(f"empty_mode: {empty_mode}")
-        if requested_history:
-            status_lines.append(f"history: {history_indices.strip()}")
+        if skipped_indices:
+            status_lines.append(f"skipped: {', '.join(f't-{i}' for i in skipped_indices)}")
         if output_image.dim() == 4 and output_image.shape[0] > 1:
             status_lines.append(f"batch: {output_image.shape[0]}")
-        preview_image = _make_status_preview(output_image, status_lines, frame_labels)
-        preview_ui = ui.PreviewImage(preview_image, cls=cls)
+
+        # Send status text only - JS widget handles preview display via live API
         status_text_lines = list(status_lines)
         if frame_labels:
             status_text_lines.append(f"frames: {', '.join(frame_labels)}")
         text_ui = ui.PreviewText("\n".join(status_text_lines))
-        ui_payload = preview_ui.as_dict()
-        ui_payload.update(text_ui.as_dict())
-        return io.NodeOutput(output_image, ui=ui_payload)
+        return io.NodeOutput(output_image, ui=text_ui.as_dict())
+
+
+class ImageLoopbackConfigure(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="Image-Loopback-Configure",
+            display_name="Configure Loopback",
+            category="Utility",
+            inputs=[
+                io.String.Input(
+                    "cache_path",
+                    default="loopback_cache",
+                    multiline=False,
+                    tooltip=(
+                        "Subfolder under this workflow's temp cache. "
+                        "Use different values for independent buffers."
+                    ),
+                ),
+                io.Int.Input(
+                    "history_limit",
+                    default=DEFAULT_HISTORY_LIMIT,
+                    min=0,
+                    tooltip="Number of cached frames to keep (0 keeps everything).",
+                ),
+            ],
+            outputs=[],
+            is_output_node=True,
+            hidden=[io.Hidden.prompt, io.Hidden.extra_pnginfo],
+        )
+
+    @classmethod
+    def validate_inputs(cls, cache_path: str, history_limit: int) -> bool | str:
+        if history_limit < 0:
+            return "history_limit must be non-negative."
+        return True
+
+    @classmethod
+    def execute(cls, cache_path: str, history_limit: int) -> io.NodeOutput:
+        workflow_key = _node_workflow_key(cls)
+        cache_dir = _cache_dir(cache_path, workflow_key)
+        _write_config(cache_dir, {"history_limit": history_limit})
+        text = "\n".join(
+            [
+                f"wf: {workflow_key}",
+                f"cache_path: {cache_path}",
+                f"history_limit: {history_limit}",
+            ]
+        )
+        return io.NodeOutput(ui=ui.PreviewText(text))
 
 
 class ImageLoopbackExtension(ComfyExtension):
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [ImageLoopbackCache, ImageLoopbackLoad]
+        return [ImageLoopbackCache, ImageLoopbackLoad, ImageLoopbackConfigure]
 
 
 async def comfy_entrypoint() -> ComfyExtension:
