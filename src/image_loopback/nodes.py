@@ -445,7 +445,14 @@ class ImageLoopbackLoad(io.ComfyNode):
         if requested_history:
             frame_labels = [f"t-{index}" for index in requested_history]
         preview_image = _make_status_preview(output_image, status_lines, frame_labels)
-        return io.NodeOutput(output_image, ui=ui.PreviewImage(preview_image, cls=cls))
+        preview_ui = ui.PreviewImage(preview_image, cls=cls)
+        status_text_lines = list(status_lines)
+        if frame_labels:
+            status_text_lines.append(f"frames: {', '.join(frame_labels)}")
+        text_ui = ui.PreviewText("\n".join(status_text_lines))
+        ui_payload = preview_ui.as_dict()
+        ui_payload.update(text_ui.as_dict())
+        return io.NodeOutput(output_image, ui=ui_payload)
 
 
 class ImageLoopbackExtension(ComfyExtension):
